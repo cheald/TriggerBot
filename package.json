@@ -1,0 +1,7 @@
+{
+  "dependencies" : {
+    "irc": "latest",
+    "lodash": "latest",
+    "natural": "latest"
+  }
+}
