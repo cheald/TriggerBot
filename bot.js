@@ -18,6 +18,7 @@ var db = new sqlite3.Database('wordbot.db');
 var allWords = [];
 var roundRewards = {}
 var hasTriggered = false
+var hints = []
 
 fs.readFile('wordlist3.txt', 'utf8', function (err,data) {
   if (err) {
@@ -32,6 +33,7 @@ function resetRound() {
   roundRewards = {}
   totalKicks = 0
   hasTriggered = false
+  hints = []
   if(newWordTimer) {
     clearTimeout(newWordTimer)
   }
@@ -57,9 +59,10 @@ function newTargetWord(notify, forceWord) {
 }
 
 function announce(channels) {
-  var hints = []
-  for(var i = 0; i < config.hintChars; i++) {
-    hints.push(Math.floor(Math.random() * currentWord.length))
+  if(hints.length == 0) {
+    for(var i = 0; i < config.hintChars; i++) {
+      hints.push(Math.floor(Math.random() * currentWord.length))
+    }
   }
   var masked = ""
   for(var i = 0; i < currentWord.length; i++) {
@@ -82,6 +85,7 @@ function announce(channels) {
 }
 
 function matchesWord(text) {
+  if(!text) return false;
   var tokens = text.tokenizeAndStem()
   var stemmedTarget = currentWord.stem()
   return _.includes(tokens, stemmedTarget)
@@ -96,7 +100,7 @@ function registerCommand(command, contexts, admin, callback) {
 
 function runCommand(cmdObj, cmd, args, user, channel) {
   if(!cmdObj) return;
-  if (config.admins[user] || !cmdObj.admin) {
+  if (config.admins[user] || !cmdObj.auth) {
     cmdObj.callback(user, channel, cmd, args)
   }
 }
@@ -114,7 +118,7 @@ function ensureUser(nick, cb) {
 }
 
 registerCommand("!guess", ["pm", "channel"], false, function(user, channel, cmd, args) {
-  if(!roundRewards[user]) {
+  if(!roundRewards[user] && roundRewards[user] !== 0) {
     roundRewards[user] = config.maxRoundReward
   }
 
@@ -135,7 +139,7 @@ registerCommand("!guess", ["pm", "channel"], false, function(user, channel, cmd,
       if(award > 0) {
         db.run("UPDATE players SET score = score + ? WHERE nick = ?", [award, user], function(err) {
           getScore(user, function(score) {
-            bot.say(user, "You have chosen...wisely! Your score is " + score + " (+" + roundRewards[user] + ")")
+            bot.say(user, "You have chosen...wisely! Your score is " + score + " (+" + award + ")")
           })
         })
       } else {
@@ -192,6 +196,7 @@ registerCommand("!buy", ["pm", "channel"], false, function(user, channel, cmd, a
 
 registerCommand("!award", ["pm", "channel"], true, function(user, channel, cmd, args) {
   ensureUser(user, function() {
+    var award = parseInt(args[1], 10)
     db.run("UPDATE players SET score = score + ? WHERE nick = ?", [award, args[0]], function() {
       bot.say(user, args[0] + " has been awarded " + award)
       bot.say(args[0], "You have been awarded " + award + " points.")
@@ -213,11 +218,20 @@ registerCommand("!kick", ["pm"], false, function(user, channel, cmd, args) {
   })
 })
 
+registerCommand("!leaders", ["pm", "channel"], true, function(user, channel, cmd, args) {
+  db.all("SELECT nick, score FROM players WHERE score > 0 ORDER BY score DESC LIMIT 10", function(err, rows) {
+    var scores = _.map(rows, function(row) { return "" + row.nick + ": " + row.score })
+    var target = channel ? channel : user
+    bot.say(target, "Current leaderboard: " + scores.join(", "))
+  })
+})
+
 var help = function(user, channel, cmd, args) {
   bot.say(user,
     "TriggerBot kicks you if you say the secret word! Words rotate every hour." + "\n" +
     "!guess <word> - guess the word for the round. Correct guesses award you points and earn you immunity from kicks." + "\n" +
     "!score - Get your current score." + "\n" +
+    "!leaders - Get the leaderboard standings." + "\n" +
     "!buy - Spend " + config.buyCost + " points to learn the current word." + "\n" +
     "!kick <user> - Spend " + config.kickCost + " points to make TriggerBot trigger on <user>." + "\n" +
     "!word - Get the current word (admin only)" + "\n" +
@@ -232,7 +246,7 @@ registerCommand("!help", ["pm", "channel"], false, help)
 registerCommand("!halp", ["pm", "channel"], false, help)
 
 function spend(nick, amount, cb) {
-  db.run("UPDATE players SET score = score - ? WHERE nick = ?", [config.buyCost, nick], function() {
+  db.run("UPDATE players SET score = score - ? WHERE nick = ?", [amount, nick], function() {
     getScore(nick, function(score) {
       cb(score)
     })
