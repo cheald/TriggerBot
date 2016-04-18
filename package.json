@@ -2,6 +2,7 @@
   "dependencies" : {
     "irc": "latest",
     "lodash": "latest",
-    "natural": "latest"
+    "natural": "latest",
+    "sqlite3": "latest"
   }
 }

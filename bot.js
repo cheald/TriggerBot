@@ -1,3 +1,4 @@
+"use strict";
 var config = require('./config');
 const IRC = require('irc');
 const fs = require('fs');
@@ -8,7 +9,7 @@ natural.PorterStemmer.attach();
 const sqlite3 = require('sqlite3').verbose();
 
 var allWords = [];
-var protectedPlayers = {};
+var protectedPlayers = new Map();
 var bot;
 var currentWord = "(none)";
 var previousWord = "(none)";
@@ -29,7 +30,7 @@ fs.readFile('wordlist3.txt', 'utf8', function (err,data) {
 });
 
 function resetRound() {
-  protectedPlayers = {}
+  protectedPlayers.clear()
   roundRewards = {}
   totalKicks = 0
   hasTriggered = false
@@ -44,11 +45,16 @@ function resetRound() {
 
 function newTargetWord(notify, forceWord) {
   previousWord = currentWord;
-  if(forceWord && typeof forceWord !== 'undefined') {
+  if(forceWord && forceWord !== undefined) {
     currentWord = forceWord
   } else {
-    index = Math.floor(Math.random() * allWords.length)
-    currentWord = allWords[index]
+    while(true) {
+      let index = Math.floor(Math.random() * allWords.length)
+      currentWord = allWords[index]
+      if(currentWord && currentWord.length > 0) {
+        break;
+      }
+    }
   }
   console.log("setting word to " + currentWord)
 
@@ -59,43 +65,38 @@ function newTargetWord(notify, forceWord) {
 }
 
 function announce(channels) {
-  if(hints.length == 0) {
-    for(var i = 0; i < config.hintChars; i++) {
+  if(hints.length === 0) {
+    for(let i = 0; i < config.hintChars; i++) {
       hints.push(Math.floor(Math.random() * currentWord.length))
     }
   }
-  var masked = ""
-  for(var i = 0; i < currentWord.length; i++) {
-    var isHint = false
-    for(var j in hints) {
-      if(hints[j] == i) {
-        masked += currentWord[hints[j]];
-        isHint = true;
-        break;
-      }
-    }
-    if(!isHint) {
+  let masked = ""
+  for(let i = 0; i < currentWord.length; i++) {
+    let hint = hints.find(j => j === i)
+    if(hint !== undefined) {
+      masked += currentWord[hint];
+    } else {
       masked += "-"
     }
   }
-  for(var channelIndex in channels) {
-    var channel = channels[channelIndex]
-    bot.action(channel, "has selected a new secret word: " + masked + " (" + currentWord.length + " letters)! The previous word was \"" + previousWord + "\"")
-  }
+  channels.forEach(ch => {
+    bot.action(ch, `has selected a new secret word: ${masked} (${currentWord.length} letters)! The previous word was "${previousWord}"`)
+  })
 }
 
 function matchesWord(text) {
   if(!text) return false;
-  var tokens = text.tokenizeAndStem()
-  var stemmedTarget = currentWord.stem()
-  return _.includes(tokens, stemmedTarget)
+  let tokens = text.tokenizeAndStem()
+  let stemmedTarget = currentWord.stem()
+  return tokens.find(t => t === stemmedTarget)
 }
 
-var commands = {channel: {}, pm: {}}
-function registerCommand(command, contexts, admin, callback) {
-  for(var i in contexts) {
-    commands[contexts[i]][command] = {auth: admin, callback: callback}
-  }
+var commands = {channel: new Map(), pm: new Map(), raw: new Map()}
+function registerCommand(command, options) {
+  if(options.contexts === undefined)
+    options.contexts = ["pm", "channel"]
+  commands.raw.set(command, options)
+  options.contexts.forEach(ctx => commands[ctx].set(command, {auth: options.admin, callback: options.run}))
 }
 
 function runCommand(cmdObj, cmd, args, user, channel) {
@@ -106,7 +107,7 @@ function runCommand(cmdObj, cmd, args, user, channel) {
 }
 
 function ensureUser(nick, cb) {
-  db.get("SELECT id FROM players WHERE nick = ?", [nick], function(err, row) {
+  db.get("SELECT id FROM players WHERE LOWER(nick) = LOWER(?)", [nick], function(err, row) {
     if(!row) {
       db.run("INSERT INTO players (nick, score) VALUES (?, 0)", [nick], function() {
         cb()
@@ -117,136 +118,203 @@ function ensureUser(nick, cb) {
   })
 }
 
-registerCommand("!guess", ["pm", "channel"], false, function(user, channel, cmd, args) {
-  if(!roundRewards[user] && roundRewards[user] !== 0) {
-    roundRewards[user] = config.maxRoundReward
-  }
+registerCommand("!guess", {
+  doc: { params: "<word>", msg: "guess the word for the round. Correct guesses award you points and earn you immunity from kicks." },
+  run: function(user, channel, cmd, args) {
+    if(!roundRewards[user] && roundRewards[user] !== 0) {
+      roundRewards[user] = config.maxRoundReward
+    }
 
-  if(protectedPlayers[user]) {
-    bot.say(user, "You already know the word for this round!")
-    return
-  }
+    if(protectedPlayers.has(user)) {
+      bot.say(user, "You already know the word for this round!")
+      return
+    }
 
-  ensureUser(user, function() {
-    var match = matchesWord(args[0])
-    if(match) {
-      protectedPlayers[user] = true
-
-      var award = roundRewards[user]
-      if(hasTriggered) {
-        award = Math.floor(award / 2)
-      }
-      if(award > 0) {
-        db.run("UPDATE players SET score = score + ? WHERE nick = ?", [award, user], function(err) {
+    ensureUser(user, function() {
+      let match = matchesWord(args[0])
+      let award = roundRewards[user]
+      if(award == 0) {
+        bot.say(user, "You have no more guesses remaining for this round.")
+      } else if(match) {
+        protectedPlayers.set(user, true)
+        if(hasTriggered) {
+          award = Math.floor(award / 2)
+        }
+        db.run("UPDATE players SET score = score + ? WHERE LOWER(nick) = LOWER(?)", [award, user], function(err) {
           getScore(user, function(score) {
-            bot.say(user, "You have chosen...wisely! Your score is " + score + " (+" + award + ")")
+            let modifier = ""
+            if(hasTriggered) {
+              modifier = ", -50% post-trigger penalty"
+            }
+            bot.say(user, `You have chosen...wisely! Your score is ${score} (+${award}${modifier})`)
           })
         })
       } else {
-        bot.say(user, "You have chosen wisely...but you receive no reward.")
-      }
-    } else {
-      roundRewards[user] -= 1
-      if(roundRewards[user] < 0) {
-        roundRewards[user] = 0
-      }
-      bot.say(user, "You have chosen...poorly. Your potential reward for this round is now " + roundRewards[user])
-      protectedPlayers[user] = false
-    }
-  })
-})
-
-registerCommand("!newword", ["pm", "channel"], true, function(user, channel, cmd, args) {
-  newTargetWord(args[0] != "silent")
-  bot.say(user, "Okay, new word is " + currentWord)
-})
-
-registerCommand("!word", ["pm"], true, function(user, channel, cmd, args) {
-  bot.say(user, "The word is " + currentWord + ", the stem is " + currentWord.stem())
-})
-
-registerCommand("!setword", ["pm"], true, function(user, channel, cmd, args) {
-  newTargetWord(true, args[0])
-  bot.say(user, "OK, the word is now " + currentWord + ", the stem is " + currentWord.stem())
-})
-
-registerCommand("!score", ["pm", "channel"], false, function(user, channel, cmd, args) {
-  getScore(user, function(score) {
-    var msg = "Your score is " + score
-    if(channel) {
-      bot.say(channel, user + ": " + msg)
-    } else {
-      bot.say(user, msg)
-    }
-  })
-})
-
-registerCommand("!buy", ["pm", "channel"], false, function(user, channel, cmd, args) {
-  getScore(user, function(score) {
-    if(score >= config.buyCost) {
-      spend(user, config.buyCost, function(score) {
-        protectedPlayers[user] = true
-        bot.say(user, "The word is " + currentWord + ", the stem is " + currentWord.stem())
-      })
-    } else {
-      bot.say(user, "You have an insufficient score to buy the word. Your balance is " + score + ", buying the word costs " + config.buyCost)
-    }
-  })
-})
-
-registerCommand("!award", ["pm", "channel"], true, function(user, channel, cmd, args) {
-  ensureUser(user, function() {
-    var award = parseInt(args[1], 10)
-    db.run("UPDATE players SET score = score + ? WHERE nick = ?", [award, args[0]], function() {
-      bot.say(user, args[0] + " has been awarded " + award)
-      bot.say(args[0], "You have been awarded " + award + " points.")
-    })
-  })
-})
-
-registerCommand("!kick", ["pm"], false, function(user, channel, cmd, args) {
-  getScore(user, function(score) {
-    if(score >= config.kickCost) {
-      spend(user, config.kickCost, function(score) {
-        for(var i in config.channels) {
-          maybeKick(args[0], config.channels[i])
+        roundRewards[user] -= 1
+        if(roundRewards[user] < 0) {
+          roundRewards[user] = 0
         }
-      })
-    } else {
-      bot.say(user, "You have an insufficient score to kick. Your balance is " + score + ", kicking costs " + config.kickCost)
-    }
-  })
+        bot.say(user, "You have chosen...poorly. Your potential reward for this round is now " + roundRewards[user])
+        protectedPlayers.delete(user)
+      }
+    })
+  }
 })
 
-registerCommand("!leaders", ["pm", "channel"], true, function(user, channel, cmd, args) {
-  db.all("SELECT nick, score FROM players WHERE score > 0 ORDER BY score DESC LIMIT 10", function(err, rows) {
-    var scores = _.map(rows, function(row) { return "" + row.nick + ": " + row.score })
-    var target = channel ? channel : user
-    bot.say(target, "Current leaderboard: " + scores.join(", "))
-  })
+registerCommand("!newword", {
+  doc: { params: "[silent]", msg: "Select a new random word. If the silent flag is passed, do so without alerting" },
+  admin: true,
+  run: function(user, channel, cmd, args) {
+    newTargetWord(args[0] != "silent")
+    bot.say(user, `Okay, new word is ${currentWord}`)
+  }
+})
+
+registerCommand("!word", {
+  contexts: ["pm"],
+  doc: "Get the current word",
+  admin: true,
+  run: function(user, channel, cmd, args) {
+    bot.say(user, `The word is ${currentWord}, the stem is ${currentWord.stem()}`)
+  }
+})
+
+registerCommand("!setword", {
+  contexts: ["pm"],
+  doc: {params: "<word>", msg: `Spend ${config.setCost} to set the new word`},
+  run: function(user, channel, cmd, args) {
+    if(!args[0]) {
+      bot.say(user, "Please specify a word")
+    } else if(args[0].length < 3) {
+      bot.say(user, "Word length must be at least 3 characters")
+    } else {
+      let setNewWord = function() {
+        protectedPlayers.set(user, true)
+        newTargetWord(true, args[0])
+        bot.say(user, `OK, the word is now ${currentWord}, the stem is ${currentWord.stem()}`)
+      }
+      if(config.admins[user]) {
+        setNewWord()
+      } else {
+        getScore(user, function(score) {
+          if(score >= config.buyCost) {
+            spend(user, config.setCost, setNewWord)
+          } else {
+            bot.say(user, `You have an insufficient score to buy the word. Your balance is ${score}, buying the word costs ${config.setCost}`)
+          }
+        })
+      }
+    }
+  }
+})
+
+registerCommand("!score", {
+  doc: {params: "[user]", msg: "Get your score, or the score for [user]"},
+  run: function(user, channel, cmd, args) {
+    console.log(user, channel, cmd, args)
+    let nick = args.length > 0 ? args[0] : user
+    getScore(nick, function(score) {
+      let msg = `${nick}'s score score is ${score}`
+      if(channel) {
+        bot.say(channel, `${user}: ${msg}`)
+      } else {
+        bot.say(user, msg)
+      }
+    })
+  }
+})
+
+registerCommand("!buy", {
+  doc: `Spend ${config.buyCost} points to learn the current word.`,
+  run: function(user, channel, cmd, args) {
+    getScore(user, function(score) {
+      if(score >= config.buyCost) {
+        spend(user, config.buyCost, function(score) {
+          protectedPlayers.set(user, true)
+          bot.say(user, `The word is ${currentWord}, the stem is ${currentWord.stem()}`)
+        })
+      } else {
+        bot.say(user, `You have an insufficient score to buy the word. Your balance is ${score}, buying the word costs ${config.buyCost}`)
+      }
+    })
+  }
+})
+
+registerCommand("!award", {
+  admin: true,
+  doc: {params: "<user> <amount>", msg: "Award points to a given user"},
+  run: function(user, channel, cmd, args) {
+    ensureUser(user, function() {
+      let award = parseInt(args[1], 10)
+      db.run("UPDATE players SET score = score + ? WHERE LOWER(nick) = LOWER(?)", [award, args[0]], function() {
+        bot.say(user, args[0] + " has been awarded " + award)
+        bot.say(args[0], "You have been awarded " + award + " points.")
+      })
+    })
+  }
+})
+
+registerCommand("!kick", {
+  contexts: ["pm"],
+  doc: {params: "<user>", msg: `Spend ${config.kickCost} points to make TriggerBot trigger on <user>.`},
+  run: function(user, channel, cmd, args) {
+    let target = args[0]
+    playerExists(target, function(exists) {
+      if(exists) {
+        getScore(user, function(score) {
+          if(score >= config.kickCost) {
+            spend(user, config.kickCost, function(score) {
+              config.channels.forEach(ch => maybeKick(target, ch, true))
+            })
+          } else {
+            bot.say(user, "You have an insufficient score to kick. Your balance is " + score + ", kicking costs " + config.kickCost)
+          }
+        })
+      } else {
+        bot.say(user, "That player has not yet participated in the game")
+      }
+    })
+  }
+})
+
+registerCommand("!leaders", {
+  doc: "Get the leaderboard standings.",
+  run: function(user, channel, cmd, args) {
+    db.all("SELECT nick, score FROM players WHERE score > 0 ORDER BY score DESC LIMIT 10", function(err, rows) {
+      let scores = rows.map(row => "" + row.nick + ": " + row.score)
+      let target = channel ? channel : user
+      bot.say(target, "Current leaderboard: " + scores.join(", "))
+    })
+  }
 })
 
 var help = function(user, channel, cmd, args) {
-  bot.say(user,
-    "TriggerBot kicks you if you say the secret word! Words rotate every hour." + "\n" +
-    "!guess <word> - guess the word for the round. Correct guesses award you points and earn you immunity from kicks." + "\n" +
-    "!score - Get your current score." + "\n" +
-    "!leaders - Get the leaderboard standings." + "\n" +
-    "!buy - Spend " + config.buyCost + " points to learn the current word." + "\n" +
-    "!kick <user> - Spend " + config.kickCost + " points to make TriggerBot trigger on <user>." + "\n" +
-    "!word - Get the current word (admin only)" + "\n" +
-    "!setword <word> - Set the current word (admin only)" + "\n" +
-    "!newword [silent] - Select a new random word. If the silent flag is passed, do so without alerting (admin only)" + "\n" +
-    "!announce - Announce the current hint (admin only)" + "\n" +
-    "!award <user> <amount> - Award points to a given user (admin only)"
-  )
+  let helpMsgs = []
+  for (var cmd of commands.raw.keys()) {
+    let opts = commands.raw.get(cmd)
+    if(opts.doc) {
+      let msg = opts.doc.msg === undefined ? opts.doc : opts.doc.msg
+      let params = opts.doc.params
+      let admin = opts.admin ? " (admin only)" : ""
+      if(params) {
+        helpMsgs.push(`${cmd} ${params} - ${msg}${admin}`)
+      } else {
+        helpMsgs.push(`${cmd} - ${msg}${admin}`)
+      }
+    }
+  }
+  bot.say(user, helpMsgs.join("\n"))
+}
+let helpOps = {
+  doc: "This command",
+  run: help
 }
 
-registerCommand("!help", ["pm", "channel"], false, help)
-registerCommand("!halp", ["pm", "channel"], false, help)
+registerCommand("!help", helpOps)
+registerCommand("!halp", helpOps)
 
 function spend(nick, amount, cb) {
-  db.run("UPDATE players SET score = score - ? WHERE nick = ?", [amount, nick], function() {
+  db.run("UPDATE players SET score = score - ? WHERE LOWER(nick) = LOWER(?)", [amount, nick], function() {
     getScore(nick, function(score) {
       cb(score)
     })
@@ -254,26 +322,31 @@ function spend(nick, amount, cb) {
 }
 
 function getScore(nick, cb) {
-  db.get("SELECT score FROM players WHERE nick = ?", [nick], function(err, row) {
+  db.get("SELECT score FROM players WHERE LOWER(nick) = LOWER(?)", [nick], function(err, row) {
     cb(row ? row.score : 0)
+  })
+}
+
+function playerExists(nick, cb) {
+  db.get("SELECT score FROM players WHERE LOWER(nick) = LOWER(?)", [nick], function(err, row) {
+    cb(row ? true : false)
   })
 }
 
 var announceCmd = function(user, channel, cmd, args) {
   announce(channel ? [channel] : config.channels)
 }
-registerCommand("!announce", ["pm"], true, announceCmd)
-registerCommand("!announce", ["channel"], false, announceCmd)
+registerCommand("!announce", {run: announceCmd})
 
 function command(user, text, channel) {
   var args = text.split(" ")
   var cmd = args.shift()
-  if(channel && channel != config.botName) {
-    runCommand(commands.channel[cmd], cmd, args, user, channel)
-    return commands.channel[cmd]
-  } else {
-    runCommand(commands.pm[cmd], cmd, args, user, channel)
-    return commands.pm[cmd]
+  if(channel && channel != config.botName && commands.channel.has(cmd)) {
+    runCommand(commands.channel.get(cmd), cmd, args, user, channel)
+    return true
+  } else if (commands.pm.get(cmd)) {
+    runCommand(commands.pm.get(cmd), cmd, args, user, undefined)
+    return true
   }
 }
 
@@ -283,13 +356,15 @@ function randomDelay(min, max) {
 
 var pendingKicks = []
 var kicker = false;
-function maybeKick(user, channel) {
-  if(protectedPlayers[user]) return;
+function maybeKick(user, channel, isManual) {
+  if(protectedPlayers.has(user)) return;
   if(config.immune[user]) return;
 
   setTimeout(function() {
     bot.say(channel, "⏰ Someone said the secret word! ⏰");
-    hasTriggered = true
+    if(!isManual) {
+      hasTriggered = true
+    }
     setTimeout(function() {
       var thumbsRoll = Math.random();
       console.log(user, "thumbs up/down roll:", thumbsRoll, thumbsRoll < 0.6 ? "kill" : "spare")
@@ -304,22 +379,28 @@ function maybeKick(user, channel) {
           clearTimeout(kicker)
         }
         kicker = setTimeout(function() {
+          if(!isManual && protectedPlayers.size > 0) {
+            for(let player of protectedPlayers.keys()) {
+              spend(player, -1, function(){})
+            }
+            bot.say(channel, `Awarded ${protectedPlayers.size} points`)
+          }
           bot.say("chanserv", "op " + channel);
           setTimeout(function() {
-            for(var i in pendingKicks) {
-              bot.send("KICK", pendingKicks[i].channel, pendingKicks[i].user, "You said the secret word! (Feel free to rejoin)");
+            pendingKicks.forEach(kick => {
+              bot.send("KICK", kick.channel, kick.user, "You said the secret word! (Feel free to rejoin)");
               totalKicks += 1
-            }
+            })
 
-            if(pendingKicks.length == 2) {
+            if(pendingKicks.length === 2) {
               bot.say(channel, "DOUBLE KILL")
-            } else if(pendingKicks.length == 3) {
+            } else if(pendingKicks.length === 3) {
               bot.say(channel, "MULTI KILL")
-            } else if(pendingKicks.length == 4) {
+            } else if(pendingKicks.length === 4) {
               bot.say(channel, "MEGA KILL")
-            } else if(pendingKicks.length == 5) {
+            } else if(pendingKicks.length === 5) {
               bot.say(channel, "ULTRA KILL")
-            } else if(pendingKicks.length == 6) {
+            } else if(pendingKicks.length === 6) {
               bot.say(channel, "M-M-M-MONSTER KILL")
             } else if(pendingKicks.length > 6) {
               bot.say(channel, "HOLY SHIT!")
@@ -334,7 +415,7 @@ function maybeKick(user, channel) {
           }, 1000)
         }, randomDelay(3000, 9000));
       } else {
-        bot.action(channel, "has spared " + user + " from a humiliating end.");
+        bot.action(channel, `has spared ${user} from a humiliating end.`);
       }
     }, 1000);
   }, randomDelay(3000, 9000));
@@ -362,10 +443,11 @@ function start() {
   })
 
   bot.addListener("join", function(channel, nick, message) {
-    if(nick == config.botName && currentWord) {
+    if(nick === config.botName && currentWord) {
       announce([channel])
     }
   })
 
   newTargetWord(false)
+  console.log("Ready to roll!")
 }
